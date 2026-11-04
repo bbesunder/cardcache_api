@@ -1,0 +1,12 @@
+name: ebay-config
+api.sandbox.ebay.com:
+  appid: ''
+  certid: 'b13a8253-c677-47ed-808b-885417e11346'
+  devid: 'SBX-a30de3ddcbe1-91c5-44d5-a428-31ee'
+  redirecturi: 'YOUR_PRODUCTION_RU_NAME'
+
+api.ebay.com:
+  appid: 'YOUR_PRODUCTION_APP_ID'
+  certid: 'YOUR_PRODUCTION_CERT_ID'
+  devid: 'YOUR_PRODUCTION_DEV_ID'
+  redirecturi: 'YOUR_PRODUCTION_RU_NAME'
