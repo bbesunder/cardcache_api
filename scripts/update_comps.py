@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+from typing import Union, Optional
 
 # Ensure root directory is in sys.path
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -10,10 +11,8 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.auth import get_access_token
+from src.service import CardPricingService
 from src.normalizer import build_search_query
-from src.search import search_ebay_listings
-from src.pricing import calculate_pricing_metrics
 
 
 def get_db_connection(db_path: str) -> sqlite3.Connection:
@@ -33,7 +32,7 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
         sys.exit(1)
 
 
-def fetch_card_metadata(conn: sqlite3.Connection, series_id: int, parallel_series_id: int | None = None) -> dict:
+def fetch_card_metadata(conn: sqlite3.Connection, series_id: str, parallel_series_id: Optional[str] = None) -> dict:
     cursor = conn.cursor()
 
     series_query = """
@@ -45,7 +44,7 @@ def fetch_card_metadata(conn: sqlite3.Connection, series_id: int, parallel_serie
         JOIN manufacturers m ON s.manufacturerId = m.manufacturerId
         WHERE s.seriesId = ?
     """
-    cursor.execute(series_query, (series_id,))
+    cursor.execute(series_query, (str(series_id),))
     series_row = cursor.fetchone()
 
     if not series_row:
@@ -60,7 +59,8 @@ def fetch_card_metadata(conn: sqlite3.Connection, series_id: int, parallel_serie
     }
 
     if parallel_series_id is not None:
-        cursor.execute("SELECT name FROM parallel_series WHERE parallelSeriesId = ?", (parallel_series_id,))
+        # Table in card cache database is 'series_parallels'
+        cursor.execute("SELECT name FROM series_parallels WHERE parallelSeriesId = ?", (str(parallel_series_id),))
         parallel_row = cursor.fetchone()
         if parallel_row:
             metadata["parallel_name"] = parallel_row["name"]
@@ -69,12 +69,15 @@ def fetch_card_metadata(conn: sqlite3.Connection, series_id: int, parallel_serie
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Query DB metadata and fetch eBay comps via official Browse API.")
-    parser.add_argument("--seriesId", type=int, required=True, help="ID from the series table")
-    parser.add_argument("--parallelSeriesId", type=int, default=None, help="Optional ID from parallel_series table")
+    parser = argparse.ArgumentParser(description="Query DB card metadata and fetch comps across eBay API and web scrapers.")
+    parser.add_argument("--seriesId", type=str, required=True, help="ID from the series table (e.g., '121159')")
+    parser.add_argument("--parallelSeriesId", type=str, default=None, help="Optional ID from series_parallels table")
     parser.add_argument("--player", type=str, required=True, help="Player name (e.g., 'Ken Griffey Jr')")
     parser.add_argument("--number", type=str, required=True, help="Card number (e.g., '1' or 'US175')")
+    parser.add_argument("--source", type=str, choices=["all", "ebay", "sportscardspro", "sportlots"], default="all",
+                        help="Data source: 'ebay', 'sportscardspro', 'sportlots', or 'all' (default: all)")
     parser.add_argument("--limit", type=int, default=50, help="Max results to fetch (default: 50)")
+    parser.add_argument("--no-history", action="store_true", help="Skip fetching individual historical transaction history")
 
     args = parser.parse_args()
 
@@ -99,44 +102,69 @@ def main():
     print(f"Card Number  : #{args.number.lstrip('#')}")
 
     search_query = build_search_query(metadata, args.player, args.number)
-    print(f"\nConstructed Query: '{search_query}'")
+    print(f"\nPrimary Query: '{search_query}'")
+    print(f"Source(s)    : {args.source}")
 
-    token, base_url = get_access_token()
-    listings = search_ebay_listings(
-        token=token,
-        base_url=base_url,
-        query_str=search_query,
+    service = CardPricingService()
+    results = service.get_card_comps(
+        metadata=metadata,
         player_name=args.player,
         card_number=args.number,
-        parallel_name=metadata["parallel_name"],
-        limit=args.limit
+        sources=[args.source],
+        limit=args.limit,
+        include_historical=not args.no_history
     )
 
-    if not listings:
-        print("No matching listings found.")
+    benchmarks = results.get("benchmarks", [])
+    if benchmarks:
+        print("\n=== Market Condition Benchmarks ===")
+        for b in benchmarks:
+            source = b.get("source", "benchmark")
+            print(f"[{source.upper()}] Card: {b['card_title']} | Set: {b['set_name']}")
+            ungraded = f"${b['ungraded_price']:.2f}" if b.get('ungraded_price') is not None else "N/A"
+            grade9 = f"${b['grade9_price']:.2f}" if b.get('grade9_price') is not None else "N/A"
+            psa10 = f"${b['psa10_price']:.2f}" if b.get('psa10_price') is not None else "N/A"
+            print(f"  -> Ungraded / Ask : {ungraded}")
+            if b.get('grade9_price') is not None or b.get('psa10_price') is not None:
+                print(f"  -> Grade 9        : {grade9}")
+                print(f"  -> PSA 10         : {psa10}")
+            if b.get('active_quantity'):
+                print(f"  -> Active Lots    : {b['active_quantity']} in stock")
+            if b.get("url"):
+                print(f"  -> Link           : {b['url']}")
+
+    listings = results.get("listings", [])
+    if not listings and not benchmarks:
+        print("\nNo matching listings or benchmarks found.")
         return
 
-    print(f"\nFound {len(listings)} verified listings:")
-    for item in listings:
-        badge = "[GRADED]" if item["graded"] else "[RAW]   "
-        print(f" {badge} ${item['price']:>7.2f} (Ship: ${item['shipping']:.2f}) | {item['title']}")
+    if listings:
+        print(f"\nFound {len(listings)} verified comp transactions:")
+        for item in listings[:20]:
+            badge = "[GRADED]" if item["graded"] else "[RAW]   "
+            source_tag = f"[{item.get('source', 'unknown')}]"
+            date_tag = f" ({item['date']})" if item.get("date") else ""
+            ship_text = f" (Ship: ${item.get('shipping', 0.0):.2f})" if item.get('shipping') else ""
+            print(f" {badge} {source_tag} ${item['price']:>7.2f}{ship_text}{date_tag} | {item['title'][:80]}")
 
-    metrics = calculate_pricing_metrics(listings)
+        if len(listings) > 20:
+            print(f" ... and {len(listings) - 20} more transactions.")
 
+    metrics = results.get("metrics", {})
     print("\n=== Pricing Summary ===")
-    raw = metrics["raw"]
-    if raw["count"] > 0:
-        print(f"Raw Median : ${raw['median']:.2f} (Avg: ${raw['average']:.2f} across {raw['count']} items)")
-        print(f"Raw Range  : ${raw['min']:.2f} - ${raw['max']:.2f}")
+    raw = metrics.get("raw", {})
+    if raw.get("count", 0) > 0:
+        print(f"Raw Median   : ${raw['median']:.2f} (Avg: ${raw['average']:.2f}, Trimmed Avg: ${raw['trimmed_mean']:.2f} across {raw['count']} items)")
+        print(f"Raw Range    : ${raw['min']:.2f} - ${raw['max']:.2f}")
     else:
-        print("Raw Comps  : None found")
+        print("Raw Comps    : None found")
 
-    graded = metrics["graded"]
-    if graded["count"] > 0:
-        print(f"Graded Med : ${graded['median']:.2f} (Avg: ${graded['average']:.2f} across {graded['count']} items)")
-        print(f"Graded Rng : ${graded['min']:.2f} - ${graded['max']:.2f}")
+    graded = metrics.get("graded", {})
+    if graded.get("count", 0) > 0:
+        print(f"Graded Median: ${graded['median']:.2f} (Avg: ${graded['average']:.2f}, Trimmed Avg: ${graded['trimmed_mean']:.2f} across {graded['count']} items)")
+        print(f"Graded Range : ${graded['min']:.2f} - ${graded['max']:.2f}")
     else:
-        print("Graded Comps: None found")
+        print("Graded Comps : None found")
 
 
 if __name__ == "__main__":
