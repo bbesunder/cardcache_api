@@ -37,6 +37,28 @@ COMPETING_MANUFACTURERS = {
     "score": {"topps", "upper deck", "fleer", "bowman"}
 }
 
+PARALLEL_MODIFIERS_REGEX = re.compile(
+    r'(?i)\b(autographed|autograph|auto|relics?|patch(?:es)?|jersey|materials?|memorabilia|'
+    r'refractors?|xfractors?|superfractors?|holofoils?|foils?|'
+    r'printing\s*plates?|sepia|shimmer|cracked\s*ice|camo|pulsar|wave|'
+    r'special\s*edition|'
+    r'red|blue|green|gold|black|orange|purple|yellow|pink|white|silver|bronze|platinum|emerald|ruby|sapphire)\b'
+)
+
+
+def extract_core_series_name(series_name: str) -> str:
+    """
+    Strips parallel and insert modifiers from a series name to recover the base set name.
+    e.g. '2006 Topps Triple Threads Autographed Relic Red' -> '2006 Topps Triple Threads'
+    """
+    if not series_name:
+        return ""
+    cleaned = PARALLEL_MODIFIERS_REGEX.sub("", series_name)
+    cleaned = re.sub(r'[/–\-]+\s*$', '', cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned if len(cleaned) >= 4 else series_name
+
+
 
 def extract_player_name_parts(player_name: str) -> dict:
     """
@@ -151,6 +173,19 @@ def generate_query_candidates(metadata: dict, player_name: str, card_number: str
         q = build_search_query(metadata, player_name, card_number, tier=tier)
         if q and q not in candidates:
             candidates.append(q)
+
+    # If the series name includes parallel/insert modifiers, also generate core base-set queries
+    orig_series = (metadata.get("series_name") or "").strip()
+    core_series = extract_core_series_name(orig_series)
+    if core_series and core_series.lower() != orig_series.lower():
+        core_meta = dict(metadata)
+        core_meta["series_name"] = core_series
+        core_q2 = build_search_query(core_meta, player_name, card_number, tier=2)
+        if core_q2 and core_q2 not in candidates:
+            candidates.insert(1, core_q2)
+        core_q3 = build_search_query(core_meta, player_name, card_number, tier=3)
+        if core_q3 and core_q3 not in candidates:
+            candidates.insert(2, core_q3)
 
     # For multi-player cards (e.g. "Brock Faber / Jared Spurgeon"), add surname pairs and individual players
     raw_sub_players = [p.strip() for p in re.split(r'[/&,]|\band\b', player_name) if p.strip()]
@@ -268,6 +303,8 @@ def verify_listing_title(
             series_clean = re.sub(rf'\b{stop}\w*\b', '', series_clean)
         if manufacturer_name:
             series_clean = re.sub(rf'\b{re.escape(manufacturer_name.lower())}\b', '', series_clean)
+        # Strip parallel/insert modifier words so generic attributes (e.g. "red", "gold") are not treated as distinctive set tokens
+        series_clean = PARALLEL_MODIFIERS_REGEX.sub('', series_clean)
 
         distinctive = [w for w in series_clean.split() if len(w) >= 3]
         # If series has strong distinctive tokens (e.g. "triple", "threads", "chrome", "heritage", "prizm", "optic", "finest")
